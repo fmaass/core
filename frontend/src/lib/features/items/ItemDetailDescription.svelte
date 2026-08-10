@@ -171,7 +171,7 @@
       onkeydown={(e) => e.key === 'Enter' && startEditingDescription()}
       role="button"
       tabindex="0"
-      class="description-hover text-left w-full rounded cursor-pointer transition-all duration-150"
+      class="description-hover text-left rounded cursor-pointer transition-colors duration-150"
       style="color: var(--ds-text);"
       title={t('items.clickToEditDescription')}
       data-testid="item-description-display"
@@ -309,10 +309,14 @@
 
 <style>
   .description-hover {
-    padding: 0;
+    /* constant padding with compensating negative margin: hover must only
+       repaint — a padding change on hover resizes the box and re-wraps the
+       description text, which reads as a wiggle */
+    width: calc(100% + 1rem);
+    padding: 0.5rem;
+    margin: -0.5rem;
   }
   .description-hover:hover {
-    padding: 0.5rem;
     background-color: var(--ds-background-input-hovered);
   }
   .action-btn {
