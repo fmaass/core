@@ -6,7 +6,6 @@
 package sanitize
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"html"
 	"regexp"
@@ -126,48 +125,46 @@ var PlainTextField Policy = PolicyFunc(plainTextField)
 var ShortIdentifier Policy = PolicyFunc(shortIdentifier)
 
 // RichText — multi-line body content (descriptions, notes, test-step
-// actual results). Strips HTML except <br /> (Milkdown uses this to
-// preserve blank lines on round-trip), preserves safe CommonMark
-// autolinks, decodes HTML entities back to plain text, neutralizes
-// dangerous Markdown URL schemes
-// (javascript:, vbscript:, data:), caps at 256 KiB. Fenced Markdown
-// code blocks are preserved verbatim so documentation can show HTML
-// snippets without the sanitizer eating them.
+// actual results). Stores the user-authored Markdown VERBATIM
+// (byte-for-byte) and applies only a 256 KiB byte cap. The XSS trust
+// boundary for this content is enforced at RENDER time — client-side
+// DOMPurify (render-markdown.js), the Milkdown editor + its link
+// sanitizer, or Go html/template auto-escape — never by stripping on
+// the way in. See INFRA-28. The former decode-then-HTML-strip pipeline
+// silently deleted inline-code spans such as `<port>` (INFRA-12) and
+// is gone.
 var RichText Policy = PolicyFunc(richText)
 
 // LongDocument — long-form Markdown document (workspace knowledge
-// pages, runbooks). Same policy shape as RichText with a 1 MiB cap.
+// pages, runbooks). Same policy as RichText — verbatim storage,
+// render-time XSS boundary — but with a 1 MiB cap (v0.8.5) rather than
+// RichText's 256 KiB. Kept as a distinct policy so callers can express
+// the intent ("this is a document, not a description") at the call
+// site, and so the cap can diverge from RichText as it does here.
 var LongDocument Policy = PolicyFunc(longDocument)
 
 // Comment — user-submitted comment content (Markdown editor input).
-// Strips every HTML tag, preserves safe CommonMark autolinks, and
-// neutralizes dangerous Markdown URLs.
-// Caps at 256 KiB, matching other non-document long-form text.
+// Same policy as RichText: stores the Markdown verbatim, caps at
+// 256 KiB, and relies on the render-time XSS boundary. One uniform
+// upper bound for any long-form user text.
 var Comment Policy = PolicyFunc(commentPolicy)
 
-// MarkdownURLOnly neutralizes dangerous URL schemes in Markdown
-// link / image syntax without touching anything else. Most callers
-// should reach for RichText / LongDocument / Comment instead — those
-// fold this in. Use this directly only when the input is already
-// HTML-stripped upstream and you just need the URL-scheme guard.
+// MarkdownURLOnly neutralizes dangerous URL schemes (javascript:,
+// vbscript:, data:) in Markdown link / image syntax without touching
+// anything else. Standalone URL-scheme guard for callers that need it
+// without the render-time boundary; the RichText / LongDocument /
+// Comment policies store content verbatim and do NOT apply this.
 var MarkdownURLOnly Policy = PolicyFunc(markdownURLOnly)
 
 // --- internals ---
 
 var (
 	strictPolicy = bluemonday.StrictPolicy()
-	brOnlyPolicy = func() *bluemonday.Policy {
-		p := bluemonday.StrictPolicy()
-		p.AllowElements("br")
-		return p
-	}()
 	// Match dangerous Markdown link/image schemes, including single-level
-	// parentheses in payloads such as javascript:alert(1).
+	// parentheses in payloads such as javascript:alert(1). Used only by
+	// MarkdownURLOnly now that the Markdown-preserving policies store
+	// content verbatim.
 	dangerousMarkdownURLRegex = regexp.MustCompile(`(?i)(!?\[[^\]]*\])\(\s*(javascript|vbscript|data)\s*:(?:\([^)]*\)|[^)])*\)`)
-	// Milkdown serializes linked URLs as CommonMark autolinks. Protect only
-	// schemes the frontend permits; otherwise the HTML sanitizer mistakes
-	// the angle-bracket syntax for an HTML element and drops the link.
-	safeMarkdownAutolinkRegex = regexp.MustCompile("(?i)<(?:(?:https?://|mailto:|tel:|page:)[^\\x00-\\x20<>]*|[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+)>")
 )
 
 // stripAndCap is the common path for PlainTextField + ShortIdentifier:
@@ -198,194 +195,51 @@ const (
 	// LongTextMaxBytes bounds descriptions, comments, and other non-document
 	// long-form user text.
 	LongTextMaxBytes = 256 * 1024
-	// LongDocumentMaxBytes bounds page and runbook Markdown.
+	// LongDocumentMaxBytes bounds page and runbook Markdown (v0.8.5).
 	LongDocumentMaxBytes = 1 * 1024 * 1024
 )
 
 func plainTextField(s string) string  { return stripAndCap(s, PlainTextFieldMaxRunes) }
 func shortIdentifier(s string) string { return stripAndCap(s, ShortIdentifierMaxRunes) }
 
-// brAllowAndCap is the common path for RichText + LongDocument:
-// decode entities, strip HTML except <br />, normalize bluemonday's
-// break output back to <br /> for Milkdown compatibility, neutralize
-// dangerous URL schemes, byte-cap. Fenced Markdown code blocks are
-// temporarily replaced with placeholders so literal examples like
-// ```html\n<script>...\n``` survive storage. Renderers must still escape code
-// spans/blocks when producing HTML.
-func brAllowAndCap(input string, maxBytes int) string {
-	if input == "" || input == "null" {
-		return ""
-	}
-	s, codeBlocks := extractFencedCodeBlocks(input)
-	s, autolinks := extractSafeMarkdownAutolinks(s)
-	s = sanitizeDecoded(s, brOnlyPolicy)
-	s = strings.ReplaceAll(s, "<br/>", "<br />")
-	s = strings.ReplaceAll(s, "<br>", "<br />")
-	s = markdownURLOnly(s)
-	s = restoreProtectedMarkdown(s, autolinks)
-	s = restoreFencedCodeBlocks(s, codeBlocks)
-	if maxBytes > 0 && len(s) > maxBytes {
-		s = s[:maxBytes]
-	}
-	return s
+// preserveAndCap is the shared path for the Markdown-preserving policies
+// (RichText, LongDocument, Comment). These fields hold user-authored
+// Markdown that is neutralized at RENDER time — client-side DOMPurify
+// (render-markdown.js), the Milkdown editor + its link sanitizer, or Go
+// html/template auto-escape — and is never emitted as raw HTML on the
+// server (template.HTML appears nowhere in the tree). The server therefore
+// stores the content byte-for-byte and applies exactly one transform: a
+// hard byte cap, the primary request-size defense. See INFRA-28.
+//
+// The former decode-then-HTML-strip pipeline (unescapeRepeated +
+// bluemonday) silently deleted inline-code spans such as `<port>` and
+// literal entities (INFRA-12) and mis-capped restored content
+// (INFRA-25); it is gone. Empty input caps to "" naturally.
+func preserveAndCap(input string, maxBytes int) string {
+	return capBytes(input, maxBytes)
 }
 
-func richText(s string) string     { return brAllowAndCap(s, LongTextMaxBytes) }
-func longDocument(s string) string { return brAllowAndCap(s, LongDocumentMaxBytes) }
-
-func commentPolicy(s string) string {
-	if s == "" {
-		return ""
+// capBytes truncates s to at most maxBytes bytes without splitting a
+// UTF-8 rune: if the cut lands inside a multi-byte rune it backs off to
+// that rune's start byte, so the result is always <= maxBytes and valid
+// UTF-8 (given valid input). maxBytes <= 0 disables the cap. This is the
+// only mutation the Markdown-preserving policies perform.
+func capBytes(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return s
 	}
-	out, codeBlocks := extractFencedCodeBlocks(s)
-	out, autolinks := extractSafeMarkdownAutolinks(out)
-	out = sanitizeDecoded(out, strictPolicy)
-	out = markdownURLOnly(out)
-	out = restoreProtectedMarkdown(out, autolinks)
-	out = restoreFencedCodeBlocks(out, codeBlocks)
-	if len(out) > LongTextMaxBytes {
-		out = out[:LongTextMaxBytes]
+	end := maxBytes
+	// A continuation byte has the top bits 10xxxxxx (0x80..0xBF). Walk
+	// left off any continuation bytes to the start of the straddling rune.
+	for end > 0 && s[end]&0xC0 == 0x80 {
+		end--
 	}
-	return out
+	return s[:end]
 }
 
-const codeBlockPlaceholderPrefix = "%%WINDSHIFT_CODE_BLOCK_"
-
-const autolinkPlaceholderPrefix = "%%WINDSHIFT_AUTOLINK_"
-
-type protectedMarkdown struct {
-	placeholder string
-	content     string
-}
-
-func extractSafeMarkdownAutolinks(input string) (string, []protectedMarkdown) {
-	if input == "" {
-		return input, nil
-	}
-
-	matches := safeMarkdownAutolinkRegex.FindAllStringIndex(input, -1)
-	if len(matches) == 0 {
-		return input, nil
-	}
-
-	var out strings.Builder
-	protected := make([]protectedMarkdown, 0, len(matches))
-	last := 0
-	for index, match := range matches {
-		content := input[match[0]:match[1]]
-		placeholder := markdownPlaceholder(autolinkPlaceholderPrefix, content, index, input)
-		protected = append(protected, protectedMarkdown{placeholder: placeholder, content: content})
-		out.WriteString(input[last:match[0]])
-		out.WriteString(placeholder)
-		last = match[1]
-	}
-	out.WriteString(input[last:])
-	return out.String(), protected
-}
-
-func restoreProtectedMarkdown(s string, protected []protectedMarkdown) string {
-	for _, value := range protected {
-		s = strings.ReplaceAll(s, value.placeholder, value.content)
-	}
-	return s
-}
-
-type fencedCodeBlock struct {
-	placeholder string
-	content     string
-}
-
-func extractFencedCodeBlocks(input string) (string, []fencedCodeBlock) {
-	if input == "" {
-		return input, nil
-	}
-
-	lines := strings.SplitAfter(input, "\n")
-	var out strings.Builder
-	var blocks []fencedCodeBlock
-	for i := 0; i < len(lines); i++ {
-		line := lines[i]
-		marker, count, ok := openingFence(line)
-		if !ok {
-			out.WriteString(line)
-			continue
-		}
-
-		var block strings.Builder
-		block.WriteString(line)
-		closed := false
-		for i++; i < len(lines); i++ {
-			block.WriteString(lines[i])
-			if closingFence(lines[i], marker, count) {
-				closed = true
-				break
-			}
-		}
-		if !closed {
-			out.WriteString(block.String())
-			break
-		}
-
-		blockContent := block.String()
-		placeholder := codeBlockPlaceholder(blockContent, len(blocks), input)
-		blocks = append(blocks, fencedCodeBlock{placeholder: placeholder, content: blockContent})
-		out.WriteString(placeholder)
-	}
-
-	return out.String(), blocks
-}
-
-func codeBlockPlaceholder(content string, index int, original string) string {
-	return markdownPlaceholder(codeBlockPlaceholderPrefix, content, index, original)
-}
-
-func markdownPlaceholder(prefix, content string, index int, original string) string {
-	sum := sha256.Sum256([]byte(content))
-	base := fmt.Sprintf("%s%d_%x%%", prefix, index, sum[:8])
-	placeholder := base
-	for suffix := 1; strings.Contains(original, placeholder); suffix++ {
-		placeholder = fmt.Sprintf("%s_%d", base, suffix)
-	}
-	return placeholder
-}
-
-func openingFence(line string) (marker byte, count int, ok bool) {
-	trimmed := strings.TrimLeft(line, " \t")
-	if len(line)-len(trimmed) > 3 || len(trimmed) < 3 {
-		return 0, 0, false
-	}
-	marker = trimmed[0]
-	if marker != '`' && marker != '~' {
-		return 0, 0, false
-	}
-	for count < len(trimmed) && trimmed[count] == marker {
-		count++
-	}
-	if count < 3 {
-		return 0, 0, false
-	}
-	return marker, count, true
-}
-
-func closingFence(line string, marker byte, openingCount int) bool {
-	trimmed := strings.TrimSpace(line)
-	if len(trimmed) < openingCount {
-		return false
-	}
-	for i := 0; i < len(trimmed); i++ {
-		if trimmed[i] != marker {
-			return false
-		}
-	}
-	return true
-}
-
-func restoreFencedCodeBlocks(s string, blocks []fencedCodeBlock) string {
-	for _, block := range blocks {
-		s = strings.ReplaceAll(s, block.placeholder, block.content)
-	}
-	return s
-}
+func richText(s string) string      { return preserveAndCap(s, LongTextMaxBytes) }
+func longDocument(s string) string  { return preserveAndCap(s, LongDocumentMaxBytes) }
+func commentPolicy(s string) string { return preserveAndCap(s, LongTextMaxBytes) }
 
 // sanitizeDecoded fully decodes HTML entities before sanitizing so nested
 // entity payloads (for example "&amp;lt;img ...&amp;gt;") cannot survive as
