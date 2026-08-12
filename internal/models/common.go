@@ -1,6 +1,11 @@
 package models
 
-import "time"
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+)
 
 // APIWarning represents a non-fatal warning in an API response
 type APIWarning struct {
@@ -111,6 +116,59 @@ type APITokenCreate struct {
 	IsTemporary   bool       `json:"-"` // Internal-only: hide ephemeral server-minted tokens from user/admin token lists
 	OAuthClientID string     `json:"-"` // Internal-only: OAuth client that requested this token
 	OAuthResource string     `json:"-"` // Internal-only: RFC 8707 resource audience
+}
+
+// UnmarshalJSON accepts expires_at as either an RFC3339 timestamp or a bare
+// calendar date (YYYY-MM-DD). The token form's <input type="date"> submits a
+// bare date, which the default time.Time decoder rejects — failing the whole
+// request body with a 400 before any token logic runs. Parsing it here keeps
+// every APITokenCreate decode path (currently POST /api-tokens) tolerant of
+// both shapes without changing the field type the handler and store consume.
+func (r *APITokenCreate) UnmarshalJSON(data []byte) error {
+	// alias drops APITokenCreate's methods so the nested Unmarshal below does
+	// not recurse into this one; ExpiresAt is shadowed as raw JSON so a bare
+	// date does not trip the embedded time.Time decoder.
+	type alias APITokenCreate
+	aux := &struct {
+		ExpiresAt json.RawMessage `json:"expires_at"`
+		*alias
+	}{alias: (*alias)(r)}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+
+	r.ExpiresAt = nil
+	if len(aux.ExpiresAt) == 0 || string(aux.ExpiresAt) == "null" {
+		return nil
+	}
+	var raw string
+	if err := json.Unmarshal(aux.ExpiresAt, &raw); err != nil {
+		return fmt.Errorf("expires_at must be a string date or RFC3339 timestamp: %w", err)
+	}
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	expiry, err := parseTokenExpiry(raw)
+	if err != nil {
+		return err
+	}
+	r.ExpiresAt = &expiry
+	return nil
+}
+
+// parseTokenExpiry accepts an RFC3339 timestamp or a bare calendar date. A bare
+// date is interpreted as the end of that day in UTC (23:59:59) so a token
+// created to expire "today" stays valid through the day rather than expiring at
+// midnight — otherwise the input's min=today would mint an already-expired token.
+func parseTokenExpiry(raw string) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t, nil
+	}
+	if d, err := time.Parse("2006-01-02", raw); err == nil {
+		return time.Date(d.Year(), d.Month(), d.Day(), 23, 59, 59, 0, time.UTC), nil
+	}
+	return time.Time{}, fmt.Errorf("invalid expires_at %q: want RFC3339 (2006-01-02T15:04:05Z) or a date (2006-01-02)", raw)
 }
 
 // APITokenResponse represents the response when creating an API token
