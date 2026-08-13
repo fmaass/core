@@ -58,8 +58,9 @@ type PortalSessionManager struct {
 	cookieManager
 	db database.Database
 	// ipBinding is the resolved SESSION_IP_BINDING mode (config.SessionIPBinding*)
-	// that portal session validation applies to a client-IP change. Wired but
-	// not yet consulted; ValidatePortalSession still behaves as before.
+	// that portal session validation applies to a client-IP change. An unknown
+	// or zero value is treated as strict so managers built without config.Load
+	// fail closed.
 	ipBinding string
 }
 
