@@ -57,17 +57,24 @@ type PortalSession struct {
 type PortalSessionManager struct {
 	cookieManager
 	db database.Database
+	// ipBinding is the resolved SESSION_IP_BINDING mode (config.SessionIPBinding*)
+	// that portal session validation applies to a client-IP change. Wired but
+	// not yet consulted; ValidatePortalSession still behaves as before.
+	ipBinding string
 }
 
 // NewPortalSessionManager creates a new portal session manager with secure cookie handling.
 // If cookieSecret is set, deterministic cookie keys are derived from it
 // so that sessions survive process restarts with the same secret.
+// ipBinding is the resolved SESSION_IP_BINDING mode; portal sessions share the
+// setting with internal user sessions because they enforce the same binding.
 // last review: ser, 210426, NOTE: Found hardcoded env var in caller
-func NewPortalSessionManager(db database.Database, useSecureCookies, useProxy bool, additionalProxies []string, cookieSecret string) *PortalSessionManager {
+func NewPortalSessionManager(db database.Database, useSecureCookies, useProxy bool, additionalProxies []string, cookieSecret, ipBinding string) *PortalSessionManager {
 	return &PortalSessionManager{
 		cookieManager: newCookieManager(useSecureCookies, useProxy, additionalProxies, cookieSecret,
 			"windshift-portal-cookie-hash", "windshift-portal-cookie-block"),
-		db: db,
+		db:        db,
+		ipBinding: ipBinding,
 	}
 }
 

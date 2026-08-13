@@ -166,6 +166,7 @@ func main() {
 				cfg.UseProxy,
 				additionalProxyList,
 				cfg.Auth.SessionSecret,
+				cfg.Auth.SessionIPBinding,
 				cfg.Auth.SessionValidationCacheTTL,
 				"ssh_session_validation",
 				sshSessionCacheMB,

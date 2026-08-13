@@ -274,6 +274,7 @@ func (s *Server) initialize() error {
 		cfg.UseProxy,
 		additionalProxyList,
 		cfg.Auth.SessionSecret,
+		cfg.Auth.SessionIPBinding,
 		cfg.Auth.SessionValidationCacheTTL,
 		primarySessionCacheMB,
 	)
@@ -441,7 +442,7 @@ func (s *Server) initialize() error {
 
 	emailVerificationService := services.NewEmailVerificationService(s.db, smtpSender, baseURL)
 
-	portalSessionManager := auth.NewPortalSessionManager(s.db, enableHTTPS, cfg.UseProxy, additionalProxyList, cfg.Auth.SessionSecret)
+	portalSessionManager := auth.NewPortalSessionManager(s.db, enableHTTPS, cfg.UseProxy, additionalProxyList, cfg.Auth.SessionSecret, cfg.Auth.SessionIPBinding)
 
 	magicLinkService := services.NewMagicLinkService(s.db, smtpSender, baseURL)
 

@@ -104,6 +104,25 @@ type SSHConfig struct {
 	KeyPath string
 }
 
+// Session IP-binding modes, resolved from SESSION_IP_BINDING into
+// AuthConfig.SessionIPBinding. Deployments behind a load balancer with a
+// changing egress IP, or with mobile clients that roam between networks, need
+// a weaker binding than one serving a fixed office range.
+const (
+	// SessionIPBindingLog records a client-IP change on a session and serves
+	// the request anyway. It is the default so the mismatch rate is observable
+	// before an operator switches to strict.
+	SessionIPBindingLog = "log"
+	// SessionIPBindingStrict rejects a session presented from a client IP
+	// other than the one it was created from.
+	SessionIPBindingStrict = "strict"
+	// SessionIPBindingOff skips the client-IP comparison entirely.
+	SessionIPBindingOff = "off"
+
+	// DefaultSessionIPBinding applies when SESSION_IP_BINDING is unset or empty.
+	DefaultSessionIPBinding = SessionIPBindingLog
+)
+
 // AuthConfig holds session-signing / SSO credential-encryption secrets.
 type AuthConfig struct {
 	// SessionSecret is resolved from SSO_SECRET (preferred) with fallback to
@@ -113,6 +132,11 @@ type AuthConfig struct {
 	// SessionValidationCacheTTL bounds local session/user-state staleness. Zero
 	// disables retained validation entries; the default is five seconds.
 	SessionValidationCacheTTL time.Duration
+	// SessionIPBinding selects how a client-IP change on an existing session is
+	// handled: SessionIPBindingLog, SessionIPBindingStrict or
+	// SessionIPBindingOff. Load validates it, so consumers can treat any other
+	// value as unreachable.
+	SessionIPBinding string
 }
 
 // WebAuthnConfig holds WebAuthn relying-party identity.

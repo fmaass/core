@@ -3,6 +3,7 @@ package config
 import (
 	"embed"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"os"
@@ -163,6 +164,16 @@ func Load(frontend embed.FS, shutdownChan chan os.Signal) Config {
 		os.Exit(1)
 	}
 
+	// Session IP binding: validated here so a typo fails at startup rather than
+	// silently weakening (or hardening) session validation at runtime.
+	rawSessionIPBinding := os.Getenv("SESSION_IP_BINDING")
+	resolvedSessionIPBinding, sessionIPBindingErr := resolveSessionIPBinding(rawSessionIPBinding)
+	if sessionIPBindingErr != nil {
+		slog.Error("FATAL: invalid SESSION_IP_BINDING",
+			"session_ip_binding", rawSessionIPBinding, "error", sessionIPBindingErr)
+		os.Exit(1)
+	}
+
 	// WebAuthn: use the browser-visible BASE_URL hostname by default. This is
 	// especially important in containers, where os.Hostname() is normally an
 	// internal container ID that browsers can never use as a relying-party ID.
@@ -225,6 +236,7 @@ func Load(frontend embed.FS, shutdownChan chan os.Signal) Config {
 		Auth: AuthConfig{
 			SessionSecret:             sessionSecret,
 			SessionValidationCacheTTL: parseDurationEnv("SESSION_VALIDATION_CACHE_TTL", 5*time.Second),
+			SessionIPBinding:          resolvedSessionIPBinding,
 		},
 		WebAuthn: WebAuthnConfig{
 			RPID:   rpID,
@@ -352,6 +364,25 @@ func postgresSSLMode() string {
 		"sslmode", raw)
 	os.Exit(1)
 	return ""
+}
+
+// resolveSessionIPBinding validates SESSION_IP_BINDING and returns the mode to
+// store in AuthConfig. It is pure — the os.Exit for an invalid value stays in
+// Load — so the accepted/rejected sets are testable without a fatal path.
+//
+// Empty (unset, or whitespace only) resolves to DefaultSessionIPBinding rather
+// than failing: the variable is optional.
+func resolveSessionIPBinding(raw string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(raw))
+	if mode == "" {
+		return DefaultSessionIPBinding, nil
+	}
+	switch mode {
+	case SessionIPBindingLog, SessionIPBindingStrict, SessionIPBindingOff:
+		return mode, nil
+	}
+	return "", fmt.Errorf("SESSION_IP_BINDING must be one of %s, %s, %s; got %q",
+		SessionIPBindingLog, SessionIPBindingStrict, SessionIPBindingOff, raw)
 }
 
 func normalizeContextPath(raw string) string {
