@@ -176,26 +176,45 @@ func (sm *PortalSessionManager) ValidatePortalSession(token, ipAddress string) (
 	}
 
 	// Validate IP address for security. Portal sessions store the client IP at
-	// creation; subsequent validations must match the same binding used by
-	// internal user sessions. Legacy rows with no recorded IP are accepted but
-	// logged so operators can investigate. Missing request IP or mismatch fails
-	// closed.
-	switch {
-	case session.IPAddress == "":
+	// creation; subsequent validations apply the same SESSION_IP_BINDING mode
+	// as internal user sessions. Legacy rows with no recorded IP are accepted
+	// but logged so operators can investigate. Under strict a missing request
+	// IP or a mismatch fails closed; under log the session is followed to its
+	// new IP; under off no comparison happens. No mode deactivates the session.
+	switch decideIPBinding(sm.ipBinding, session.IPAddress, ipAddress) {
+	case ipBindingLegacyUnbound:
 		slog.Warn("portal session has no recorded IP, skipping bind check",
 			slog.Int("portal_customer_id", session.PortalCustomerID),
 			slog.Int("session_id", session.ID))
-	case ipAddress == "":
+	case ipBindingRejectNoRequestIP:
 		slog.Warn("request has no client IP, rejecting IP-bound portal session",
 			slog.Int("portal_customer_id", session.PortalCustomerID),
 			slog.String("session_ip", session.IPAddress))
 		return nil, ErrPortalSessionInvalid
-	case session.IPAddress != ipAddress:
+	case ipBindingAcceptNoRequestIP:
+		slog.Warn("request has no client IP, accepting IP-bound portal session",
+			slog.Int("portal_customer_id", session.PortalCustomerID),
+			slog.String("session_ip", session.IPAddress),
+			slog.String("session_ip_binding", sm.ipBinding))
+	case ipBindingAcceptUnparsedIP:
+		slog.Warn("request client IP is not a valid address, accepting IP-bound portal session without rebinding",
+			slog.Int("portal_customer_id", session.PortalCustomerID),
+			slog.String("session_ip", session.IPAddress),
+			slog.String("request_ip", ipAddress),
+			slog.String("session_ip_binding", sm.ipBinding))
+	case ipBindingRejectMismatch:
 		slog.Warn("portal session IP mismatch",
 			slog.Int("portal_customer_id", session.PortalCustomerID),
 			slog.String("session_ip", session.IPAddress),
 			slog.String("request_ip", ipAddress))
 		return nil, ErrPortalSessionInvalid
+	case ipBindingRebindMismatch:
+		slog.Warn("portal session IP mismatch",
+			slog.Int("portal_customer_id", session.PortalCustomerID),
+			slog.String("session_ip", session.IPAddress),
+			slog.String("request_ip", ipAddress))
+		sm.rebindPortalSessionIP(token, session, ipAddress)
+	case ipBindingMatch, ipBindingSkip:
 	}
 
 	if channelID.Valid {
@@ -214,6 +233,27 @@ func (sm *PortalSessionManager) ValidatePortalSession(token, ipAddress string) (
 	}
 
 	return session, nil
+}
+
+// rebindPortalSessionIP moves a portal session to the client IP it is now
+// presented from (log mode only). Like the user-session rebind, a failed write
+// costs bookkeeping rather than availability: the request is still served and
+// the next one retries. Portal sessions have no local validation cache, so
+// nothing needs invalidating; the in-memory session is advanced on success
+// because it is returned to the caller.
+func (sm *PortalSessionManager) rebindPortalSessionIP(token string, session *PortalSession, ipAddress string) {
+	// Portal tokens are stored as digests with the same legacy plaintext
+	// fallback as user sessions, so the predicate must match both forms.
+	query := `UPDATE portal_customer_sessions SET ip_address = ? WHERE session_token IN (?, ?) AND is_active = true`
+	if _, err := sm.db.ExecWrite(query, ipAddress, hashSessionToken(token), token); err != nil {
+		slog.Error("failed to rebind portal session to the new client IP",
+			slog.Int("portal_customer_id", session.PortalCustomerID),
+			slog.Int("session_id", session.ID),
+			slog.String("request_ip", ipAddress),
+			slog.Any("error", err))
+		return
+	}
+	session.IPAddress = ipAddress
 }
 
 // DeletePortalSession invalidates a session

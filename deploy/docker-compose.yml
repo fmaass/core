@@ -25,6 +25,7 @@ services:
       - PORT=8080
       - USE_PROXY=true
       - SSO_SECRET=${SSO_SECRET}
+      - SESSION_IP_BINDING=${SESSION_IP_BINDING:-log}
       - ATTACHMENT_PATH=/data/attachments
       - DB_PATH=/data/windshift.db
       - LOG_LEVEL=info

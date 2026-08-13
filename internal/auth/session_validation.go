@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"windshift/internal/cacheutil"
+	"windshift/internal/config"
 	"windshift/internal/models"
 )
 
@@ -290,6 +292,68 @@ func validateSessionState(session *Session) error {
 	return nil
 }
 
+// ipBindingDecision is what a validator should do about the request's client
+// IP. The decision is shared by the user-session and portal validators; each
+// keeps its own log wording and error value.
+type ipBindingDecision int
+
+const (
+	// ipBindingMatch: the request IP equals the bound IP — nothing to do.
+	ipBindingMatch ipBindingDecision = iota
+	// ipBindingSkip: binding disabled; no comparison and no log line.
+	ipBindingSkip
+	// ipBindingLegacyUnbound: the session predates IP binding (no stored IP).
+	ipBindingLegacyUnbound
+	// ipBindingRejectNoRequestIP: bound session, no client IP, fail closed.
+	ipBindingRejectNoRequestIP
+	// ipBindingAcceptNoRequestIP: same situation, reported but served.
+	ipBindingAcceptNoRequestIP
+	// ipBindingAcceptUnparsedIP: the request carries an IP that is not a valid
+	// address, so there is nothing safe to rebind to; reported but served.
+	ipBindingAcceptUnparsedIP
+	// ipBindingRejectMismatch: the session moved to another IP, fail closed.
+	ipBindingRejectMismatch
+	// ipBindingRebindMismatch: the session moved; rebind it and serve.
+	ipBindingRebindMismatch
+)
+
+// decideIPBinding maps a SESSION_IP_BINDING mode plus the stored/request IP
+// pair onto one decision.
+//
+// Any mode other than log or off is treated as strict, so a manager built
+// outside config.Load (which validates the env var) keeps the historical
+// fail-closed behavior rather than silently loosening it.
+func decideIPBinding(mode, sessionIP, requestIP string) ipBindingDecision {
+	if mode == config.SessionIPBindingOff {
+		return ipBindingSkip
+	}
+	lenient := mode == config.SessionIPBindingLog
+
+	switch {
+	case sessionIP == "":
+		return ipBindingLegacyUnbound
+	case requestIP == "":
+		if lenient {
+			return ipBindingAcceptNoRequestIP
+		}
+		return ipBindingRejectNoRequestIP
+	case sessionIP != requestIP:
+		if lenient {
+			// Only a real address may be written back to the session row. The
+			// client-IP extractor returns RemoteAddr verbatim when it does not
+			// parse (utils.IPExtractor.GetClientIP), and these validators are
+			// exported, so an unparseable value must be reported and served
+			// rather than persisted as the session's new binding.
+			if net.ParseIP(requestIP) == nil {
+				return ipBindingAcceptUnparsedIP
+			}
+			return ipBindingRebindMismatch
+		}
+		return ipBindingRejectMismatch
+	}
+	return ipBindingMatch
+}
+
 func (sm *SessionManager) validateSessionSnapshot(token string, session *Session, ipAddress string) (*Session, error) {
 	if err := validateSessionState(session); err != nil {
 		if errors.Is(err, ErrSessionExpired) {
@@ -298,27 +362,72 @@ func (sm *SessionManager) validateSessionSnapshot(token string, session *Session
 		return nil, err
 	}
 
-	// The IP check is deliberately performed for every request, including
-	// cache hits. Empty stored IPs remain accepted for legacy sessions; an
-	// empty request IP fails closed for sessions that are bound to an IP.
-	switch {
-	case session.IPAddress == "":
+	if err := sm.applySessionIPBinding(token, session, ipAddress); err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+// applySessionIPBinding enforces the configured SESSION_IP_BINDING mode. The
+// check is deliberately performed for every request, including cache hits.
+// Empty stored IPs remain accepted for legacy sessions; under strict an empty
+// request IP fails closed for sessions that are bound to an IP, while log
+// reports the same situations and serves them. No mode deletes or deactivates
+// the session: a rejection fails this request only.
+func (sm *SessionManager) applySessionIPBinding(token string, session *Session, ipAddress string) error {
+	switch decideIPBinding(sm.ipBinding, session.IPAddress, ipAddress) {
+	case ipBindingLegacyUnbound:
 		slog.Warn("session has no recorded IP, skipping bind check",
 			slog.Int("user_id", session.UserID),
 			slog.Int("session_id", session.ID))
-	case ipAddress == "":
+	case ipBindingRejectNoRequestIP:
 		slog.Warn("request has no client IP, rejecting IP-bound session",
 			slog.Int("user_id", session.UserID),
 			slog.String("session_ip", session.IPAddress))
-		return nil, ErrInvalidSession
-	case session.IPAddress != ipAddress:
+		return ErrInvalidSession
+	case ipBindingAcceptNoRequestIP:
+		slog.Warn("request has no client IP, accepting IP-bound session",
+			slog.Int("user_id", session.UserID),
+			slog.String("session_ip", session.IPAddress),
+			slog.String("session_ip_binding", sm.ipBinding))
+	case ipBindingAcceptUnparsedIP:
+		slog.Warn("request client IP is not a valid address, accepting IP-bound session without rebinding",
+			slog.Int("user_id", session.UserID),
+			slog.String("session_ip", session.IPAddress),
+			slog.String("request_ip", ipAddress),
+			slog.String("session_ip_binding", sm.ipBinding))
+	case ipBindingRejectMismatch:
 		slog.Warn("session IP mismatch",
 			slog.Int("user_id", session.UserID),
 			slog.String("session_ip", session.IPAddress),
 			slog.String("request_ip", ipAddress))
-		return nil, ErrInvalidSession
+		return ErrInvalidSession
+	case ipBindingRebindMismatch:
+		slog.Warn("session IP mismatch",
+			slog.Int("user_id", session.UserID),
+			slog.String("session_ip", session.IPAddress),
+			slog.String("request_ip", ipAddress))
+		sm.rebindSessionIP(token, session, ipAddress)
+	case ipBindingMatch, ipBindingSkip:
 	}
-	return session, nil
+	return nil
+}
+
+// rebindSessionIP moves a session to the client IP it is now presented from.
+// A failed write costs bookkeeping, not availability: the request is still
+// served and the next one retries the rebind. The in-memory snapshot is
+// advanced only on success, because it is what the triggering request reports
+// back through /api/auth/me.
+func (sm *SessionManager) rebindSessionIP(token string, session *Session, ipAddress string) {
+	if err := sm.UpdateSessionIP(token, ipAddress); err != nil {
+		slog.Error("failed to rebind session to the new client IP",
+			slog.Int("user_id", session.UserID),
+			slog.Int("session_id", session.ID),
+			slog.String("request_ip", ipAddress),
+			slog.Any("error", err))
+		return
+	}
+	session.IPAddress = ipAddress
 }
 
 func (validator *sessionValidator) get(key string) (*Session, bool) {

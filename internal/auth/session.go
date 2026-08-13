@@ -264,6 +264,23 @@ func (sm *SessionManager) RefreshSession(token string, rememberMe bool) error {
 	return nil
 }
 
+// UpdateSessionIP rebinds a session to a new client IP. It is used by the log
+// SESSION_IP_BINDING mode, where a session that moves between networks is
+// followed rather than rejected. Sessions are stored as token digests with a
+// legacy plaintext fallback, so the predicate matches both forms — a
+// plaintext-only predicate would match zero rows for every current session.
+func (sm *SessionManager) UpdateSessionIP(token, ipAddress string) error {
+	query := `UPDATE user_sessions SET ip_address = ? WHERE session_token IN (?, ?) AND is_active = true`
+	_, err := sm.db.ExecWrite(query, ipAddress, hashSessionToken(token), token)
+	if err != nil {
+		return fmt.Errorf("failed to update session IP: %w", err)
+	}
+	// The cached snapshot still carries the previous IP; drop it so the next
+	// request revalidates against the rebound row instead of rebinding again.
+	sm.invalidateSessionValidationToken(token)
+	return nil
+}
+
 // SetSessionCookie sets a secure session cookie
 func (sm *SessionManager) SetSessionCookie(w http.ResponseWriter, r *http.Request, token string, rememberMe bool) error {
 	maxAge := int(DefaultSessionDuration.Seconds())
