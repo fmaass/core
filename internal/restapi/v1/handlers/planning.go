@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"windshift/internal/database"
+	"windshift/internal/logger"
 	"windshift/internal/models"
 	"windshift/internal/restapi"
 	"windshift/internal/restapi/v1/dto"
@@ -1065,13 +1066,15 @@ func (h *MilestoneHandler) GetProgressInWorkspace(w http.ResponseWriter, r *http
 
 type IterationHandler struct {
 	BaseHandler
-	planningService *services.PlanningService
+	planningService   *services.PlanningService
+	completionService *services.IterationCompletionService
 }
 
 func NewIterationHandler(db database.Database, permissionService *services.PermissionService) *IterationHandler {
 	return &IterationHandler{
-		BaseHandler:     NewBaseHandler(db, permissionService),
-		planningService: services.NewPlanningService(db),
+		BaseHandler:       NewBaseHandler(db, permissionService),
+		planningService:   services.NewPlanningService(db),
+		completionService: services.NewIterationCompletionService(db),
 	}
 }
 
@@ -1428,6 +1431,123 @@ func (h *IterationHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.RespondNoContent(w)
+}
+
+// IterationCompleteRequest is the optional body for the completion endpoint.
+// An absent body (or an absent field) completes the iteration and moves every
+// incomplete member to the backlog.
+type IterationCompleteRequest struct {
+	MoveIncompleteToIterationID *int `json:"move_incomplete_to_iteration_id,omitempty"`
+}
+
+// IterationCompleteResponse is the v1 view of services.CompleteIterationResult.
+// The internal SQL-statement counter is deliberately not part of the public
+// contract; moved items render through the shared v1 item DTO.
+type IterationCompleteResponse struct {
+	IterationID       int                `json:"iteration_id"`
+	TargetIterationID *int               `json:"target_iteration_id"`
+	Status            string             `json:"status"`
+	AlreadyCompleted  bool               `json:"already_completed"`
+	MovedCount        int                `json:"moved_count"`
+	Items             []dto.ItemResponse `json:"items"`
+	DurationMS        int64              `json:"duration_ms"`
+}
+
+// respondIterationCompletionError maps the completion service's sentinel
+// errors onto the v1 error contract. The service reports a missing source and
+// a missing move_incomplete_to target with the same sentinel, so the 404
+// message names both rather than claiming which one was absent.
+func (h *IterationHandler) respondIterationCompletionError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, services.ErrIterationCompletionNotFound):
+		h.RespondError(w, r, restapi.NewAPIError(http.StatusNotFound, restapi.ErrCodeNotFound,
+			"Iteration not found: neither the iteration nor move_incomplete_to_iteration_id resolved"))
+	case errors.Is(err, services.ErrIterationCompletionForbidden):
+		h.RespondError(w, r, restapi.ErrForbidden)
+	case errors.Is(err, services.ErrIterationCompletionLimit):
+		h.RespondError(w, r, restapi.NewAPIError(http.StatusConflict, restapi.ErrCodeConflict,
+			"Iteration has more incomplete items than one completion can move"))
+	case errors.Is(err, services.ErrIterationCompletionConflict):
+		h.RespondError(w, r, restapi.NewAPIError(http.StatusConflict, restapi.ErrCodeConflict, err.Error()))
+	default:
+		h.RespondInternalError(w, r)
+	}
+}
+
+// Complete handles POST /rest/api/v1/iterations/{id}/complete
+//
+// @Summary      Complete an iteration
+// @Description  Atomically moves every incomplete item off the iteration and marks it completed. Items go to `move_incomplete_to_iteration_id` when supplied and to the backlog otherwise; the target must be open and reachable from every affected item's workspace. Completing an already-completed iteration succeeds with `already_completed: true` and moves nothing. This is the only way to reach status `completed` — PUT /iterations/{id} rejects the transition.
+// @Tags         iterations
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id    path      int                               true   "Iteration ID"
+// @Param        body  body      handlers.IterationCompleteRequest  false  "Optional carry-forward target"
+// @Success      200   {object}  handlers.IterationCompleteResponse
+// @Failure      400   {object}  handlers.ErrorResponse  "Invalid iteration ID or request body"
+// @Failure      401   {object}  handlers.ErrorResponse
+// @Failure      403   {object}  handlers.ErrorResponse  "Token lacks the iterations:write scope, or caller cannot edit the iteration or an affected item's workspace"
+// @Failure      404   {object}  handlers.ErrorResponse  "Iteration or carry-forward target not found"
+// @Failure      409   {object}  handlers.ErrorResponse  "Iteration is canceled, the target is not open or not shared by every affected workspace, or too many items to move"
+// @Failure      500   {object}  handlers.ErrorResponse
+// @Router       /iterations/{id}/complete [post]
+func (h *IterationHandler) Complete(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.RequireAuth(w, r)
+	if !ok {
+		return
+	}
+	id, ok := h.ParsePathID(w, r, "id", "iteration ID")
+	if !ok {
+		return
+	}
+	var req IterationCompleteRequest
+	if !h.DecodeOptionalBodyOrRespond(w, r, &req) {
+		return
+	}
+
+	// Same service call and therefore the same transaction, authorization and
+	// carry-forward semantics as the cookie-auth route; only the transport and
+	// the permission resolution differ.
+	result, err := h.completionService.Complete(r.Context(), services.CompleteIterationRequest{
+		IterationID:       id,
+		TargetIterationID: req.MoveIncompleteToIterationID,
+		UserID:            user.ID,
+		AuthorizeWorkspace: func(workspaceID int) (bool, error) {
+			return h.Perms.CanEditWorkspace(user.ID, workspaceID)
+		},
+		AuthorizeGlobal: func() (bool, error) {
+			return h.Perms.HasGlobalPermission(user.ID, models.PermissionIterationManage)
+		},
+	})
+	if err != nil {
+		h.respondIterationCompletionError(w, r, err)
+		return
+	}
+
+	h.Auditor.LogWithDetails(r, user, logger.ActionIterationUpdate, logger.ResourceIteration, &id, "", map[string]any{
+		"operation":           "complete",
+		"moved_count":         result.MovedCount,
+		"target_iteration_id": result.TargetIterationID,
+		"already_completed":   result.AlreadyCompleted,
+	})
+
+	baseURL := getBaseURL(r)
+	items := make([]dto.ItemResponse, 0, len(result.Items))
+	for _, item := range result.Items {
+		if mapped := dto.MapItemToResponse(item, baseURL); mapped != nil {
+			items = append(items, *mapped)
+		}
+	}
+	h.RespondOK(w, IterationCompleteResponse{
+		IterationID:       result.IterationID,
+		TargetIterationID: result.TargetIterationID,
+		Status:            result.Status,
+		AlreadyCompleted:  result.AlreadyCompleted,
+		MovedCount:        result.MovedCount,
+		Items:             items,
+		DurationMS:        result.DurationMS,
+	})
 }
 
 // ----------------------------------------

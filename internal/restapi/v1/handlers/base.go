@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -103,6 +105,25 @@ func (b *BaseHandler) ParsePathID(w http.ResponseWriter, r *http.Request, param,
 		return 0, false
 	}
 	return id, true
+}
+
+// DecodeOptionalBodyOrRespond is DecodeBodyOrRespond for endpoints whose body
+// is optional: an absent or empty body leaves v at its zero value and succeeds.
+// Malformed JSON is still a client error.
+func (b *BaseHandler) DecodeOptionalBodyOrRespond(w http.ResponseWriter, r *http.Request, v any) bool {
+	if r.Body == nil {
+		return true
+	}
+	err := restapi.DecodeJSONBody(w, r, v)
+	if err == nil || errors.Is(err, io.EOF) {
+		return true
+	}
+	if restapi.IsRequestBodyTooLarge(err) {
+		restapi.RespondError(w, r, restapi.NewAPIError(http.StatusRequestEntityTooLarge, restapi.ErrCodeRequestTooLarge, "Request body too large"))
+		return false
+	}
+	restapi.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, "Invalid request body"))
+	return false
 }
 
 // DecodeBodyOrRespond decodes JSON or writes the corresponding client error.

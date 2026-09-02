@@ -224,6 +224,9 @@ func RegisterRoutes(deps restapi.Deps) {
 	v1.HandleWithMiddleware("POST /iterations", iterationHandler.Create, bearerAuth.RequirePermission("iterations:write"))
 	v1.HandleWithMiddleware("GET /iterations/{id}", iterationHandler.Get, bearerAuth.RequirePermission("iterations:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("PUT /iterations/{id}", iterationHandler.Update, bearerAuth.RequirePermission("iterations:write"), router.RequireNumericID)
+	// Completion is the only transition to status "completed" (PUT rejects it),
+	// so the bearer surface needs it to close an iteration at all.
+	v1.HandleWithMiddleware("POST /iterations/{id}/complete", iterationHandler.Complete, bearerAuth.RequirePermission("iterations:write"), router.RequireNumericID)
 	v1.HandleWithMiddleware("DELETE /iterations/{id}", iterationHandler.Delete, bearerAuth.RequirePermission("iterations:delete"), router.RequireNumericID)
 
 	// ============================================
