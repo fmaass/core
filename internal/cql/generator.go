@@ -262,7 +262,30 @@ func fieldValue(node *ASTNode) (any, error) {
 	}
 }
 
+// errNumericWorkspaceValue rejects a bare number on the generic `workspace`
+// field. That field resolves against w.name / w.key only, so a numeric id
+// matched no row and the query returned an empty 200 that callers could not
+// tell apart from a genuine no-results answer (INFRA-243). Numeric ids have
+// their own field (workspaceId / workspace_id), and workspace_scope.go already
+// accepts a NUMBER literal only there; failing here keeps the SQL generator
+// and the scope extractor agreed on that boundary. A workspace whose name or
+// key really is all digits stays reachable by quoting the value, which
+// tokenizes as STRING rather than NUMBER.
+func errNumericWorkspaceValue(node *ASTNode) error {
+	if node == nil || node.Type != NodeLiteral || node.DataType != NUMBER {
+		return nil
+	}
+	return fmt.Errorf(
+		"workspace does not accept a numeric id: %[1]s matches a workspace name or key. "+
+			"Use workspaceId = %[1]s for the id, the key form (workspace = INFRA), "+
+			"or quote the value (workspace = %[1]q) to match a name or key that is all digits",
+		node.Value)
+}
+
 func (g *SQLGenerator) generateWorkspaceComparison(node *ASTNode) (sql string, args []any, err error) {
+	if err := errNumericWorkspaceValue(node.Right); err != nil {
+		return "", nil, err
+	}
 	value, err := fieldValue(node.Right)
 	if err != nil {
 		return "", nil, err
@@ -289,6 +312,9 @@ func (g *SQLGenerator) generateWorkspaceInExpression(node *ASTNode) (sql string,
 	values := make([]any, 0, len(node.Values.Arguments))
 	placeholders := make([]string, 0, len(node.Values.Arguments))
 	for _, valueNode := range node.Values.Arguments {
+		if err := errNumericWorkspaceValue(valueNode); err != nil {
+			return "", nil, err
+		}
 		value, err := fieldValue(valueNode)
 		if err != nil {
 			return "", nil, err
