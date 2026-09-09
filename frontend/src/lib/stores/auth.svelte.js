@@ -1,7 +1,12 @@
 import { derived, writable } from 'svelte/store';
+import { forgetSessionChoice, rememberSessionChoice } from './sessionRefresh.js';
 import { setAPIRequestSessionKey } from '../api/core.js';
 import { api } from '../api.js';
 import { clearStores, getStoreValue } from './storeUtils.js';
+
+function sessionChoiceStorage() {
+  return typeof localStorage === 'undefined' ? null : localStorage;
+}
 
 function policyValue(error, field) {
   return error?.[field] ?? error?.body?.[field];
@@ -88,6 +93,10 @@ function createAuthStore() {
         isAuthenticated.set(true);
         loading.set(false);
         error.set(null);
+        // An existing browser session picked up at bootstrap — an SSO return
+        // among them. Nothing here chose a lifetime, so the sliding refresh
+        // falls back to reading the session's own window (INFRA-92).
+        forgetSessionChoice(sessionChoiceStorage());
         return { status: 'authenticated' };
       } catch (err) {
         loading.set(false);
@@ -141,6 +150,13 @@ function createAuthStore() {
         }
 
         if (response.success) {
+          // The session the server describes carries no "remember me" flag, and
+          // inferring one from its window stops being reliable once the window
+          // has been slid, so the choice is recorded where it was made — the
+          // sliding refresh (INFRA-92) asks for the lifetime that was chosen
+          // here rather than silently shortening a 30-day session to 24 hours.
+          rememberSessionChoice(credentials?.remember_me === true, sessionChoiceStorage());
+
           // Get session details before marking the store authenticated so a
           // follow-up failure cannot leave user/isAuthenticated inconsistent.
           const sessionResponse = await api.auth.getCurrentUser();
@@ -211,6 +227,7 @@ function createAuthStore() {
       clearStores(user, session, error);
       isAuthenticated.set(false);
       loading.set(false);
+      forgetSessionChoice(sessionChoiceStorage());
     },
 
     // Logout from all sessions
@@ -226,6 +243,7 @@ function createAuthStore() {
       clearStores(user, session, error);
       isAuthenticated.set(false);
       loading.set(false);
+      forgetSessionChoice(sessionChoiceStorage());
     },
 
     // Refresh session
@@ -268,6 +286,7 @@ function createAuthStore() {
       isAuthenticated.set(false);
       loading.set(false);
       error.set('Session expired. Please log in again.');
+      forgetSessionChoice(sessionChoiceStorage());
     },
 
     // Confirm that a WebAuthn completion created/elevated the browser session,
@@ -281,6 +300,9 @@ function createAuthStore() {
         session.set(response.session);
         isAuthenticated.set(true);
         loading.set(false);
+        // A WebAuthn completion carries no remember-me choice of its own, so any
+        // choice a previous password login recorded must not be inherited.
+        forgetSessionChoice(sessionChoiceStorage());
         return true;
       } catch (err) {
         clearStores(user, session);
@@ -299,6 +321,8 @@ function createAuthStore() {
       isAuthenticated.set(true);
       loading.set(false);
       error.set(null);
+      // Same as the passkey completion: no lifetime was chosen here.
+      forgetSessionChoice(sessionChoiceStorage());
     },
 
     // Clear error

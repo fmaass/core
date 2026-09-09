@@ -2,6 +2,11 @@
   import { onMount } from 'svelte';
   import { currentRoute, initRouter, isMobileRoute, navigate } from './lib/router.js';
   import { authStore } from './lib/stores';
+  import {
+    attachSessionActivity,
+    createSessionRefresher,
+    readSessionChoice,
+  } from './lib/stores/sessionRefresh.js';
   import { moduleSettings } from './lib/stores/moduleSettings.js';
   import { api } from './lib/api.js';
   import { APP_NAME } from './lib/constants.js';
@@ -212,6 +217,32 @@
       navigate('/m');
     }
   }
+
+  // Sliding session expiry (INFRA-92). POST /auth/refresh existed end to end and
+  // had no caller, so the deadline set at login was a hard ceiling however much
+  // the app was used. The refresher is driven by what the person does — a
+  // navigation they make, a pointer or a key — and never by a timer, and never
+  // by the mount itself, so an idle session still expires exactly when its login
+  // said it would. It acts at most once per activity window, and only once the
+  // session is more than half spent.
+  //
+  // The refresh goes through authStore.refreshSession rather than the API client
+  // directly, because POST /auth/refresh answers {success, message} and carries
+  // no session: the store re-reads /auth/me and writes the NEW expiry back, and
+  // without that write the half-spent test would keep reading the original
+  // deadline and go permanently "not due" past it.
+  const sessionRefresher = createSessionRefresher({
+    getSession: () => ($authStore.isAuthenticated ? $authStore.session : null),
+    refresh: (rememberMe) => authStore.refreshSession(rememberMe),
+    readChoice: () => (typeof localStorage === 'undefined' ? null : readSessionChoice(localStorage)),
+  });
+
+  onMount(() =>
+    attachSessionActivity({
+      refresher: sessionRefresher,
+      subscribeRoute: (fn) => currentRoute.subscribe(fn),
+    })
+  );
 
   async function checkSetupStatus() {
     // Always ask the backend. setup_completed is cheap to fetch and the

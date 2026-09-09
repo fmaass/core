@@ -31,6 +31,9 @@ cx
 # Public regression coverage for the workflow designer's edge direction and for
 # the transition-preservation marker ships with the implementation (INFRA-60).
 !frontend/src/lib/utils/dataTransformers.spec.js
+# Public regression coverage for sliding session expiry ships with the
+# implementation (INFRA-92).
+!frontend/src/lib/stores/sessionRefresh.spec.js
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
