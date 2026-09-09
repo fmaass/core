@@ -43,6 +43,54 @@ const (
 	pendingVerificationDuration = 5 * time.Minute
 )
 
+// authPendingWindow reports how long a session may remain in the given
+// pending state, measured from the session's creation — the login handler
+// creates the session and marks it pending in the same request with no I/O
+// in between (internal/handlers/auth.go:240 CreateSession, :254
+// SetAuthPending), so created_at is the start of the window. Marking an older
+// session pending would only make the window shorter, never longer. A session that is
+// flagged enrollment_required without an auth_pending_type is an enrollment
+// session, the same reading loadSessionContext applies.
+func authPendingWindow(pendingType string, enrollmentRequired bool) (time.Duration, bool) {
+	switch pendingType {
+	case AuthPendingPasskeyVerification:
+		return pendingVerificationDuration, true
+	case AuthPendingEnrollment:
+		return pendingEnrollmentDuration, true
+	}
+	if !enrollmentRequired {
+		return 0, false
+	}
+	// Pending, but the type did not survive (an older cache entry) or is not
+	// one this build knows. Fail closed on the SHORTEST window rather than
+	// handing an unidentified pending session the longer enrollment one.
+	return shortestAuthPendingWindow(), true
+}
+
+// shortestAuthPendingWindow is the tightest window any pending state may have.
+func shortestAuthPendingWindow() time.Duration {
+	if pendingVerificationDuration < pendingEnrollmentDuration {
+		return pendingVerificationDuration
+	}
+	return pendingEnrollmentDuration
+}
+
+// sessionDeadline is when a session stops being usable: its stored expiry,
+// narrowed to the pending window while a required WebAuthn ceremony is
+// outstanding. Deriving the narrow window instead of writing it into
+// expires_at is what lets a completed ceremony keep the login's own duration
+// (INFRA-91).
+func sessionDeadline(session *Session) time.Time {
+	window, pending := authPendingWindow(session.AuthPendingType, session.EnrollmentRequired)
+	if !pending {
+		return session.ExpiresAt
+	}
+	if deadline := session.CreatedAt.Add(window); deadline.Before(session.ExpiresAt) {
+		return deadline
+	}
+	return session.ExpiresAt
+}
+
 func hashSessionToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return sessionTokenHashPrefix + hex.EncodeToString(sum[:])
@@ -240,8 +288,23 @@ func (sm *SessionManager) DeleteAllUserSessions(userID int) error {
 
 // CleanupExpiredSessions removes expired sessions from the database
 func (sm *SessionManager) CleanupExpiredSessions() error {
-	query := `UPDATE user_sessions SET is_active = false WHERE expires_at < ? AND is_active = true`
-	_, err := sm.db.ExecWrite(query, time.Now())
+	// A pending session's deadline is its own short window measured from
+	// created_at, not expires_at (which now keeps the login's duration), so
+	// an abandoned ceremony is reaped on the same schedule as before.
+	now := time.Now()
+	query := `
+		UPDATE user_sessions SET is_active = false
+		WHERE is_active = true
+		AND (
+			expires_at < ?
+			OR ((auth_pending_type = ? OR (auth_pending_type IS NULL AND COALESCE(enrollment_required, false))) AND created_at < ?)
+			OR (auth_pending_type = ? AND created_at < ?)
+		)
+	`
+	_, err := sm.db.ExecWrite(query, now,
+		AuthPendingEnrollment, now.Add(-pendingEnrollmentDuration),
+		AuthPendingPasskeyVerification, now.Add(-pendingVerificationDuration),
+	)
 	if err != nil {
 		return fmt.Errorf("failed to cleanup expired sessions: %w", err)
 	}
@@ -323,12 +386,13 @@ func (sm *SessionManager) SetAuthPending(sessionID int, pendingType string) erro
 	if pendingType != AuthPendingEnrollment && pendingType != AuthPendingPasskeyVerification {
 		return fmt.Errorf("invalid auth pending type %q", pendingType)
 	}
-	duration := pendingEnrollmentDuration
-	if pendingType == AuthPendingPasskeyVerification {
-		duration = pendingVerificationDuration
-	}
-	query := `UPDATE user_sessions SET enrollment_required = true, auth_pending_type = ?, expires_at = ? WHERE id = ?`
-	_, err := sm.db.ExecWrite(query, pendingType, time.Now().Add(duration), sessionID)
+	// The pending window is DERIVED (see authPendingDeadline), not written
+	// over expires_at. Overwriting it destroyed the only record of how long
+	// this session was meant to live, so completing the ceremony could only
+	// ever restore the 24h default and a remember-me session silently lost
+	// its 30 days (INFRA-91).
+	query := `UPDATE user_sessions SET enrollment_required = true, auth_pending_type = ? WHERE id = ?`
+	_, err := sm.db.ExecWrite(query, pendingType, sessionID)
 	if err != nil {
 		return fmt.Errorf("failed to set auth pending state: %w", err)
 	}
@@ -346,8 +410,11 @@ func (sm *SessionManager) SetEnrollmentRequired(sessionID int, required bool) er
 
 // ClearEnrollmentRequired elevates a pending session after its required WebAuthn ceremony.
 func (sm *SessionManager) ClearEnrollmentRequired(sessionID int) error {
-	query := `UPDATE user_sessions SET enrollment_required = false, auth_pending_type = NULL, expires_at = ? WHERE id = ?`
-	_, err := sm.db.ExecWrite(query, time.Now().Add(DefaultSessionDuration), sessionID)
+	// expires_at is deliberately untouched: the row still carries the
+	// duration the login chose (24h, or 30 days for remember-me), and
+	// clearing the pending flags is all that is left to do (INFRA-91).
+	query := `UPDATE user_sessions SET enrollment_required = false, auth_pending_type = NULL WHERE id = ?`
+	_, err := sm.db.ExecWrite(query, sessionID)
 	if err != nil {
 		return fmt.Errorf("failed to clear auth pending state: %w", err)
 	}
@@ -370,12 +437,13 @@ func (sm *SessionManager) IsEnrollmentRequired(sessionID int) (bool, error) {
 // successful first-passkey registration. It deliberately does not elevate
 // password+passkey verification sessions, which still require an assertion.
 func (sm *SessionManager) ClearEnrollmentRequiredByUserID(userID int) error {
+	// expires_at is deliberately untouched here too (INFRA-91).
 	query := `
-		UPDATE user_sessions SET enrollment_required = false, auth_pending_type = NULL, expires_at = ?
+		UPDATE user_sessions SET enrollment_required = false, auth_pending_type = NULL
 		WHERE user_id = ? AND is_active = true
 		AND (auth_pending_type = ? OR (auth_pending_type IS NULL AND enrollment_required = true))
 	`
-	_, err := sm.db.ExecWrite(query, time.Now().Add(DefaultSessionDuration), userID, AuthPendingEnrollment)
+	_, err := sm.db.ExecWrite(query, userID, AuthPendingEnrollment)
 	if err != nil {
 		return fmt.Errorf("failed to clear enrollment required: %w", err)
 	}

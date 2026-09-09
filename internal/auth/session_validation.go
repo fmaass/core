@@ -33,6 +33,15 @@ type cachedSessionValidation struct {
 	SessionVersion uint64    `json:"session_version"`
 	UserVersion    uint64    `json:"user_version"`
 	Session        Session   `json:"session"`
+	// AuthPendingType is carried beside the session because Session.Token and
+	// Session.AuthPendingType are json:"-": a cache round-trip would
+	// otherwise return a pending session whose type is unknown, and the
+	// pending window (sessionDeadline) and the middleware's pending-endpoint
+	// check both read it. The tag on Session stays as it is — that struct is
+	// never serialised to a client (handlers build SessionInfo, see
+	// internal/handlers/auth.go:347) and keeping it out of any accidental
+	// response body is worth more than the tag's convenience here.
+	AuthPendingType string `json:"auth_pending_type,omitempty"`
 }
 
 type sessionValidationLoad struct {
@@ -286,7 +295,7 @@ func validateSessionState(session *Session) error {
 	if session == nil || !session.IsActive || session.User == nil || !session.User.IsActive {
 		return ErrInvalidSession
 	}
-	if !time.Now().Before(session.ExpiresAt) {
+	if !time.Now().Before(sessionDeadline(session)) {
 		return ErrSessionExpired
 	}
 	return nil
@@ -461,7 +470,9 @@ func (validator *sessionValidator) get(key string) (*Session, bool) {
 		_ = validator.cache.Delete(key)
 		return nil, false
 	}
-	return cloneSession(&entry.Session), true
+	restored := cloneSession(&entry.Session)
+	restored.AuthPendingType = entry.AuthPendingType
+	return restored, true
 }
 
 func (validator *sessionValidator) setIfCurrent(key string, session *Session, epoch, sequence uint64) bool {
@@ -478,12 +489,13 @@ func (validator *sessionValidator) setIfCurrent(key string, session *Session, ep
 	}
 
 	value, err := json.Marshal(cachedSessionValidation{
-		LoadedAt:       time.Now(),
-		Epoch:          epoch,
-		TokenVersion:   tokenVersion,
-		SessionVersion: sessionVersion,
-		UserVersion:    userVersion,
-		Session:        *cloneSession(session),
+		LoadedAt:        time.Now(),
+		Epoch:           epoch,
+		TokenVersion:    tokenVersion,
+		SessionVersion:  sessionVersion,
+		UserVersion:     userVersion,
+		Session:         *cloneSession(session),
+		AuthPendingType: session.AuthPendingType,
 	})
 	if err != nil {
 		validator.cacheDecodeFailures.Add(1)
