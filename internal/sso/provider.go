@@ -33,6 +33,12 @@ type SSOProvider struct {
 	IssuerURL             string `json:"issuer_url,omitempty"`
 	ClientID              string `json:"client_id,omitempty"`
 	ClientSecretEncrypted string `json:"-"`                       // Never send to client
+	// hasClientSecret carries the list query's derived flag. The collection
+	// query deliberately never selects the secret column, so the flag is
+	// selected instead of being derived from an always-empty
+	// ClientSecretEncrypted, which reported "no secret configured" for a
+	// provider that has one (INFRA-103). Read it through HasClientSecret.
+	hasClientSecret bool `json:"-"`
 	ClientSecret          string `json:"client_secret,omitempty"` // Only used for input, never stored
 	Scopes                string `json:"scopes"`
 	AutoProvisionUsers    bool   `json:"auto_provision_users"`
@@ -62,7 +68,9 @@ const providerColumnsWithSecret = `id, slug, name, provider_type, enabled, is_de
 //
 //nolint:gosec // G101: SQL column name constants, not credentials
 const providerColumnsWithoutSecret = `id, slug, name, provider_type, enabled, is_default,
-	issuer_url, client_id, scopes,
+	issuer_url, client_id,
+	CASE WHEN COALESCE(client_secret_encrypted, '') <> '' THEN 1 ELSE 0 END,
+	scopes,
 	auto_provision_users, require_verified_email,
 	attribute_mapping,
 	saml_idp_metadata_url, saml_idp_sso_url, saml_idp_certificate, saml_sp_entity_id, saml_sign_requests,
@@ -83,8 +91,14 @@ func scanProviderRow(row interface {
 		&provider.Enabled, &provider.IsDefault,
 		&issuerURL, &clientID,
 	}
+	var hasClientSecretFlag int
 	if withSecret {
 		dests = append(dests, &clientSecretEncrypted)
+	} else {
+		// providerColumnsWithoutSecret selects the derived flag in the
+		// secret column's position, so the secret value never leaves the
+		// database while the flag still reaches the serializer.
+		dests = append(dests, &hasClientSecretFlag)
 	}
 	dests = append(dests,
 		&scopes,
@@ -101,6 +115,7 @@ func scanProviderRow(row interface {
 	provider.IssuerURL = issuerURL.String
 	provider.ClientID = clientID.String
 	provider.ClientSecretEncrypted = clientSecretEncrypted.String
+	provider.hasClientSecret = hasClientSecretFlag != 0
 	provider.Scopes = scopes.String
 	provider.AttributeMapping = attributeMapping.String
 	provider.SAMLIdPMetadataURL = samlIDPMetadataURL.String
@@ -151,6 +166,15 @@ func (p *SSOProvider) GetAttributeMap() (*AttributeMap, error) {
 		return nil, err
 	}
 	return &mapping, nil
+}
+
+// HasClientSecret reports whether a client secret is configured for this
+// provider, without exposing the secret itself. Both read paths answer the
+// same way: the detail query loads the encrypted secret, the list query loads
+// only the derived flag, and a provider built in memory (create/update) still
+// carries the encrypted value it was just given.
+func (p *SSOProvider) HasClientSecret() bool {
+	return p.ClientSecretEncrypted != "" || p.hasClientSecret
 }
 
 // ProviderStore handles database operations for SSO providers

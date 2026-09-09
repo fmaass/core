@@ -1207,7 +1207,7 @@ func (h *SSOHandler) providerToResponse(p *sso.SSOProvider) *SSOProviderResponse
 		IsDefault:            p.IsDefault,
 		IssuerURL:            p.IssuerURL,
 		ClientID:             p.ClientID,
-		HasClientSecret:      p.ClientSecretEncrypted != "",
+		HasClientSecret:      p.HasClientSecret(),
 		Scopes:               p.Scopes,
 		AutoProvisionUsers:   p.AutoProvisionUsers,
 		RequireVerifiedEmail: p.RequireVerifiedEmail,
