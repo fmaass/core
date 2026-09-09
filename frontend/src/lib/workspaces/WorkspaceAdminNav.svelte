@@ -24,8 +24,10 @@
         onmouseenter={(e) => onNavMouseEnter(e, active, item.danger)}
         onmouseleave={(e) => onNavMouseLeave(e, active, item.danger)}
       >
-        <ItemIcon class="w-4 h-4" />
-        {t(item.labelKey)}
+        <span class="workspace-nav-item-content flex items-center gap-2 min-w-0">
+          <ItemIcon class="w-4 h-4" />
+          {t(item.labelKey)}
+        </span>
       </a>
     {/each}
   </nav>

@@ -473,8 +473,10 @@
       onmouseenter={(e) => onNavMouseEnter(e, item.isActive)}
       onmouseleave={(e) => onNavMouseLeave(e, item.isActive)}
     >
-      <ItemIcon class="w-4 h-4" />
-      {item.label}
+      <span class="workspace-nav-item-content flex items-center gap-2 min-w-0">
+        <ItemIcon class="w-4 h-4" />
+        {item.label}
+      </span>
     </a>
   </Tooltip>
 {/snippet}
@@ -750,19 +752,27 @@
     background-color: var(--ds-border-focused, #3b82f6);
   }
 
-  /* Enhanced navigation item transitions */
+  /* Enhanced navigation item transitions.
+     The nudge is applied to the inner content wrapper, never to the nav item
+     itself: translating the hit target moves it out from under a pointer resting
+     near its left edge, which un-hovers it, which reverts the transform, which
+     re-hovers it — a self-sustaining hover loop (INFRA-20). Only paint moves now;
+     the item's box stays exactly where the pointer found it. */
   :global(.workspace-nav-item) {
     transition:
       background-color var(--duration-normal, 200ms) var(--ease-smooth, ease),
-      color var(--duration-fast, 100ms) var(--ease-smooth, ease),
-      transform var(--duration-fast, 100ms) var(--ease-smooth, cubic-bezier(0.16, 1, 0.3, 1));
+      color var(--duration-fast, 100ms) var(--ease-smooth, ease);
   }
 
-  :global(.workspace-nav-item:hover) {
+  :global(.workspace-nav-item .workspace-nav-item-content) {
+    transition: transform var(--duration-fast, 100ms) var(--ease-smooth, cubic-bezier(0.16, 1, 0.3, 1));
+  }
+
+  :global(.workspace-nav-item:hover .workspace-nav-item-content) {
     transform: translateX(4px);
   }
 
-  :global(.workspace-nav-item:active) {
+  :global(.workspace-nav-item:active .workspace-nav-item-content) {
     transform: translateX(2px) scale(0.98);
   }
 
@@ -779,8 +789,8 @@
 
   /* Reduced motion support */
   @media (prefers-reduced-motion: reduce) {
-    :global(.workspace-nav-item:hover),
-    :global(.workspace-nav-item:active) {
+    :global(.workspace-nav-item:hover .workspace-nav-item-content),
+    :global(.workspace-nav-item:active .workspace-nav-item-content) {
       transform: none;
     }
 

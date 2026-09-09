@@ -179,8 +179,10 @@
             onmouseenter={(e) => { if (!isActive) e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text);'; }}
             onmouseleave={(e) => { if (!isActive) e.currentTarget.style.cssText = isActive ? 'background: var(--ds-surface-selected); color: var(--ds-text);' : 'color: var(--ds-text-subtle);'; }}
           >
-            <ViewIcon class="w-4 h-4" />
-            {view.label}
+            <span class="workspace-nav-item-content flex items-center gap-2 min-w-0">
+              <ViewIcon class="w-4 h-4" />
+              {view.label}
+            </span>
           </a>
         </Tooltip>
       {/each}
@@ -200,8 +202,10 @@
             onmouseenter={(e) => e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text);'}
             onmouseleave={(e) => e.currentTarget.style.cssText = 'color: var(--ds-text-subtle);'}
           >
-            <Pencil class="w-4 h-4" />
-            Edit Collection
+            <span class="workspace-nav-item-content flex items-center gap-2 min-w-0">
+              <Pencil class="w-4 h-4" />
+              Edit Collection
+            </span>
           </a>
         </Tooltip>
       </div>
