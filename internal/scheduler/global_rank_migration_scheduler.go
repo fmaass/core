@@ -46,6 +46,8 @@ type GlobalRankMigrationScheduler struct {
 	// afterTick is a deterministic white-box test notification. Production
 	// constructors leave it nil.
 	afterTick func()
+
+	dbBackoff *dbOutageBackoff
 }
 
 // NewGlobalRankMigrationScheduler builds the in-process resumable migration
@@ -60,9 +62,10 @@ func NewGlobalRankMigrationScheduler(db database.Database, owner string) *Global
 		worker:   repository.NewGlobalRankMigrationWorker(db, owner, repository.DefaultGlobalRankMigrationBatchSize, repository.DefaultGlobalRankMigrationLease),
 		runRepo:  repository.NewSchedulerRunRepository(db),
 		owner:    owner,
-		interval: defaultGlobalRankMigrationInterval,
-		active:   defaultGlobalRankMigrationActive,
-		timeout:  globalRankMigrationTickTimeout,
+		interval:  defaultGlobalRankMigrationInterval,
+		active:    defaultGlobalRankMigrationActive,
+		timeout:   globalRankMigrationTickTimeout,
+		dbBackoff: newDBOutageBackoff(globalRankMigrationSchedulerName),
 	}
 }
 
@@ -228,6 +231,10 @@ func (s *GlobalRankMigrationScheduler) RunOnce(ctx context.Context) (result repo
 }
 
 func (s *GlobalRankMigrationScheduler) tick(parent context.Context) (continueActive bool) {
+	// Skipped while the database is unreachable (INFRA-328).
+	if s.dbBackoff.Skip() {
+		return false
+	}
 	start := time.Now()
 	itemsProcessed := 0
 	var runErr error
@@ -248,9 +255,12 @@ func (s *GlobalRankMigrationScheduler) tick(parent context.Context) (continueAct
 	result, active, err := s.RunOnce(ctx)
 	if err != nil {
 		runErr = err
-		slog.Error("global rank migration scheduler tick", "owner", s.owner, "error", err)
+		if !s.dbBackoff.Failure(err) {
+			slog.Error("global rank migration scheduler tick", "owner", s.owner, "error", err)
+		}
 		return false
 	}
+	s.dbBackoff.Success()
 	if !active {
 		return false
 	}

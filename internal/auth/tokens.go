@@ -171,7 +171,10 @@ func (tm *TokenManager) ValidateToken(token string) (*models.User, *models.APITo
 		  AND (t.expires_at IS NULL OR t.expires_at > CURRENT_TIMESTAMP)
 	`, tokenPrefix)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to query tokens: %w", err)
+		// Classified here, where the driver error is intact: a caller that
+		// only sees the message cannot tell a dead database from a bad token
+		// (INFRA-328).
+		return nil, nil, fmt.Errorf("failed to query tokens: %w", database.MarkUnavailable(err))
 	}
 	defer rows.Close()
 
@@ -239,7 +242,7 @@ func (tm *TokenManager) ValidateToken(token string) (*models.User, *models.APITo
 		// Iteration failed mid-stream (e.g. driver/connection error). Surface
 		// it as an error instead of letting the caller see "invalid token",
 		// which would obscure real outages.
-		return nil, nil, fmt.Errorf("iterate token rows: %w", err)
+		return nil, nil, fmt.Errorf("iterate token rows: %w", database.MarkUnavailable(err))
 	}
 
 	return nil, nil, fmt.Errorf("invalid token")

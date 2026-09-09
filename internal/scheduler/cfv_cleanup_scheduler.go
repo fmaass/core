@@ -39,6 +39,8 @@ type CFVCleanupScheduler struct {
 	checkInterval  time.Duration
 	batchSize      int
 	staleThreshold time.Duration // running rows older than this are re-claimed
+
+	dbBackoff *dbOutageBackoff
 }
 
 const schedulerName = "cfv_cleanup"
@@ -54,6 +56,7 @@ func NewCFVCleanupScheduler(db database.Database) *CFVCleanupScheduler {
 		batchSize:      500,
 		staleThreshold: 30 * time.Minute,
 		stopChan:       make(chan struct{}),
+		dbBackoff:      newDBOutageBackoff(schedulerName),
 	}
 }
 
@@ -107,10 +110,20 @@ func (s *CFVCleanupScheduler) loop(ticker *time.Ticker, stopChan <-chan struct{}
 const claimMaxJobsPerTick = 20
 
 func (s *CFVCleanupScheduler) tick() {
+	// A tick inside an outage pause spends a dial on a database that was
+	// refusing connections a moment ago and logs one more line (INFRA-328).
+	if s.dbBackoff.Skip() {
+		return
+	}
 	start := time.Now()
 	totalItems := 0
 	var runErr error
 	defer recordSchedulerRun(s.runRepo, schedulerName, start, &totalItems, &runErr)
+	defer func() {
+		if !s.dbBackoff.Failure(runErr) {
+			s.dbBackoff.Success()
+		}
+	}()
 
 	// First: rehabilitate stale 'running' rows so a crashed process doesn't
 	// strand jobs indefinitely.

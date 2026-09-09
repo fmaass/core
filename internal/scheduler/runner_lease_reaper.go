@@ -38,6 +38,8 @@ type RunnerLeaseReaper struct {
 	queuedStallAfter time.Duration // a remote run queued unclaimed for this long is flagged
 	maxRunDuration   time.Duration // a run 'running' for this long is failed regardless of heartbeat
 	now              func() time.Time
+
+	dbBackoff *dbOutageBackoff
 }
 
 const (
@@ -63,6 +65,7 @@ func NewRunnerLeaseReaper(runs *repository.AgentRunRepository, runners *reposito
 		queuedStallAfter: defaultQueuedStallAfter,
 		maxRunDuration:   defaultMaxRunDuration,
 		now:              func() time.Time { return time.Now().UTC() },
+		dbBackoff:        newDBOutageBackoff("runner_lease_reaper"),
 	}
 }
 
@@ -108,13 +111,20 @@ func (s *RunnerLeaseReaper) loop(ticker *time.Ticker, stop chan struct{}) {
 }
 
 func (s *RunnerLeaseReaper) tick() {
+	// Skipped while the database is unreachable (INFRA-328).
+	if s.dbBackoff.Skip() {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	reaped, revoked, err := s.Sweep(ctx)
 	if err != nil {
-		slog.Error("runner lease reaper sweep", "error", err)
+		if !s.dbBackoff.Failure(err) {
+			slog.Error("runner lease reaper sweep", "error", err)
+		}
 		return
 	}
+	s.dbBackoff.Success()
 	if reaped > 0 || revoked > 0 {
 		slog.Info("runner lease reaper swept", "reaped_runs", reaped, "revoked_instances", revoked)
 	}

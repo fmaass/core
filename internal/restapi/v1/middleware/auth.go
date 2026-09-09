@@ -3,6 +3,7 @@ package middleware
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -10,6 +11,11 @@ import (
 	"windshift/internal/models"
 	"windshift/internal/restapi"
 )
+
+// tokenStoreRetryAfterSeconds is the Retry-After a client is given when the
+// token store is unreachable. Short: a Postgres restart is usually seconds, and
+// the client's own backoff takes it from there.
+const tokenStoreRetryAfterSeconds = "5"
 
 // BearerAuth middleware requires bearer token authentication for the public API
 // It only accepts Authorization: Bearer crw_xxx tokens, not session cookies
@@ -61,6 +67,21 @@ func (ba *BearerAuth) RequireAuth(next http.Handler) http.Handler {
 
 		user, apiToken, err := ba.tokenManager.ValidateToken(token)
 		if err != nil {
+			// An unreachable token store is not a bad token. Answering 401
+			// INVALID_TOKEN while Postgres was down told every client its
+			// credential had been rejected, which invites a rotation that
+			// fixes nothing (INFRA-328). Classified by error type, before the
+			// message is looked at at all.
+			if auth.IsTokenStoreUnavailable(err) {
+				slog.Error("token store unavailable", slog.String("component", "restapi.auth"), slog.Any("error", err))
+				w.Header().Set("Retry-After", tokenStoreRetryAfterSeconds)
+				restapi.RespondError(w, r, restapi.NewAPIError(
+					http.StatusServiceUnavailable,
+					restapi.ErrCodeServiceUnavailable,
+					"Authentication store is temporarily unavailable",
+				))
+				return
+			}
 			// Check for specific error types
 			errMsg := err.Error()
 			if strings.Contains(errMsg, "expired") {
