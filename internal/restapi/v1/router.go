@@ -42,7 +42,7 @@ func RegisterRoutes(deps restapi.Deps) {
 	agentRunHandler := handlers.NewAgentRunHandler(db, permissionService)
 	commentHandler := handlers.NewCommentHandler(db, permissionService, deps.CommentService)
 	milestoneHandler := handlers.NewMilestoneHandler(db, permissionService)
-	iterationHandler := handlers.NewIterationHandler(db, permissionService)
+	iterationHandler := handlers.NewIterationHandler(db, permissionService, deps.BulkUpdateEmitter)
 	collectionHandler := handlers.NewCollectionHandler(db, permissionService)
 	actionHandler := handlers.NewActionHandler(db, permissionService, deps.ActionService)
 	attachmentHandler := handlers.NewAttachmentHandler(db, permissionService, deps.AttachmentPath)

@@ -1068,13 +1068,18 @@ type IterationHandler struct {
 	BaseHandler
 	planningService   *services.PlanningService
 	completionService *services.IterationCompletionService
+	// bulkEmitter is the same fan-out the cookie-auth completion uses. A nil
+	// emitter emits nothing and returns the moved items unchanged, which is
+	// what an embedder that has not wired restapi.Deps.BulkUpdateEmitter gets.
+	bulkEmitter *services.BulkUpdateEmitter
 }
 
-func NewIterationHandler(db database.Database, permissionService *services.PermissionService) *IterationHandler {
+func NewIterationHandler(db database.Database, permissionService *services.PermissionService, bulkEmitter *services.BulkUpdateEmitter) *IterationHandler {
 	return &IterationHandler{
 		BaseHandler:       NewBaseHandler(db, permissionService),
 		planningService:   services.NewPlanningService(db),
 		completionService: services.NewIterationCompletionService(db),
+		bulkEmitter:       bulkEmitter,
 	}
 }
 
@@ -1524,6 +1529,11 @@ func (h *IterationHandler) Complete(w http.ResponseWriter, r *http.Request) {
 		h.respondIterationCompletionError(w, r, err)
 		return
 	}
+
+	// The same side-effect fan-out the cookie-auth route runs: webhooks,
+	// notifications, mentions, activity and project-name masking. Without it a
+	// CLI-driven completion moved the items and told nobody (INFRA-295).
+	result.Items = h.bulkEmitter.Emit(user.ID, user.Username, result.Updates)
 
 	h.Auditor.LogWithDetails(r, user, logger.ActionIterationUpdate, logger.ResourceIteration, &id, "", map[string]any{
 		"operation":           "complete",

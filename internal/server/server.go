@@ -1616,6 +1616,7 @@ func (s *Server) initialize() error {
 		ItemCreationService:            itemHandler.ItemCreationService(),
 		ItemUpdateApplicationService:   itemHandler.ItemUpdateApplicationService(),
 		ItemDeletionApplicationService: itemHandler.ItemDeletionApplicationService(),
+		BulkUpdateEmitter:              itemHandler.BulkUpdateEmitter(),
 		PageApplicationService:         pageHandler.PageApplicationService(),
 		PageDiagramService:             pageDiagramService,
 	}, v1.RegisterRoutes)

@@ -26,7 +26,9 @@ type harness struct {
 	token string
 }
 
-func newHarness(t *testing.T) *harness {
+// newHarness boots the router with no side-effect emitter wired. opts mutate
+// the Deps before registration — the emit test passes a recording emitter.
+func newHarness(t *testing.T, opts ...func(*restapi.Deps)) *harness {
 	t.Helper()
 
 	dsn := "file:" + filepath.Join(t.TempDir(), "windshift-test.db")
@@ -61,12 +63,16 @@ func newHarness(t *testing.T) *harness {
 	}
 
 	mux := http.NewServeMux()
-	v1.RegisterRoutes(restapi.Deps{
+	deps := restapi.Deps{
 		Mux:               mux,
 		DB:                db,
 		TokenManager:      tokenManager,
 		PermissionService: permissionService,
-	})
+	}
+	for _, opt := range opts {
+		opt(&deps)
+	}
+	v1.RegisterRoutes(deps)
 
 	return &harness{mux: mux, db: db, token: created.Token}
 }

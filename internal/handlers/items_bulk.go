@@ -161,46 +161,8 @@ func (h *ItemHandler) respondBulkMutationError(w http.ResponseWriter, r *http.Re
 	}
 }
 
+// emitBulkUpdateResults hands the results to the shared emitter both this
+// surface and REST v1 use, so the two cannot drift apart (INFRA-295).
 func (h *ItemHandler) emitBulkUpdateResults(userID int, username string, results []services.UpdateItemResult) []*models.Item {
-	items := make([]*models.Item, 0, len(results))
-	for i := range results {
-		result := &results[i]
-		if result.OriginalItem == nil || result.Item == nil {
-			continue
-		}
-		original, updated := result.OriginalItem, result.Item
-		if h.activityTracker != nil {
-			if err := h.activityTracker.TrackItemActivity(userID, updated.ID, services.ActivityEdit); err != nil {
-				slog.Warn("failed to track bulk item edit activity", "item_id", updated.ID, "error", err)
-			}
-		}
-		if h.itemCache != nil && projectResolutionChanged(original, updated) {
-			h.invalidateEffectiveProjectSubtree(updated.ID)
-		}
-		assigneeChanged := !intPtrEqual(original.AssigneeID, updated.AssigneeID)
-		if h.eventCoordinator != nil {
-			h.eventCoordinator.EmitItemUpdated(original, updated, result.StatusChanged, assigneeChanged, userID, result.FieldChanges, username)
-		} else if h.webhookSender != nil {
-			h.webhookSender.DispatchEvent("item.updated", updated)
-		}
-		if h.mentionService != nil && original.Description != updated.Description {
-			if err := h.mentionService.ProcessMentions(services.ProcessMentionsParams{
-				SourceType: "item_description", SourceID: updated.ID, Content: updated.Description,
-				ItemID: updated.ID, WorkspaceID: updated.WorkspaceID, ActorUserID: userID,
-			}); err != nil {
-				slog.Warn("failed to process bulk item description mentions", "item_id", updated.ID, "error", err)
-			}
-		}
-		items = append(items, updated)
-	}
-	masked := make([]models.Item, len(items))
-	for i, item := range items {
-		masked[i] = *item
-	}
-	h.maskInaccessibleProjectNames(userID, masked)
-	result := make([]*models.Item, len(masked))
-	for i := range masked {
-		result[i] = &masked[i]
-	}
-	return result
+	return h.bulkEmitter.Emit(userID, username, results)
 }

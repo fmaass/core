@@ -56,6 +56,7 @@ type ItemHandler struct {
 	transitionMatrix  *services.TransitionMatrixService
 	bulkUpdate        *services.ItemUpdateService
 	iterationComplete *services.IterationCompletionService
+	bulkEmitter       *services.BulkUpdateEmitter
 	bulkMetrics       *services.BulkOperationMetrics
 	dbRequestTimeout  time.Duration
 }
@@ -91,7 +92,7 @@ func NewItemHandler(db database.Database, permissionService *services.Permission
 	itemDeletion := services.NewItemDeletionApplicationService(db, permissionService)
 	itemDeletion.SetCache(itemCache, hierarchyService)
 
-	return &ItemHandler{
+	h := &ItemHandler{
 		db:                  db,
 		itemRepo:            repository.NewItemRepository(db),
 		hierarchyService:    hierarchyService,
@@ -112,6 +113,48 @@ func NewItemHandler(db database.Database, permissionService *services.Permission
 		bulkMetrics:         services.NewBulkOperationMetrics(),
 		dbRequestTimeout:    defaultDBRequestTimeout,
 	}
+	// The hooks read h's fields at emit time, not now: the webhook sender, the
+	// mention service and the event coordinator are wired by setters after this
+	// constructor returns, so an emitter that captured them here would be a
+	// permanently unwired one.
+	h.bulkEmitter = services.NewBulkUpdateEmitter(services.BulkUpdateSideEffects{
+		TrackEdit: func(userID, itemID int) error {
+			if h.activityTracker == nil {
+				return nil
+			}
+			return h.activityTracker.TrackItemActivity(userID, itemID, services.ActivityEdit)
+		},
+		InvalidateProjectSubtree: func(itemID int) {
+			if h.itemCache == nil {
+				return
+			}
+			h.invalidateEffectiveProjectSubtree(itemID)
+		},
+		EmitItemUpdated: func(original, updated *models.Item, statusChanged, assigneeChanged bool, userID int, fieldChanges []services.HistoryEntry, username string) {
+			if h.eventCoordinator != nil {
+				h.eventCoordinator.EmitItemUpdated(original, updated, statusChanged, assigneeChanged, userID, fieldChanges, username)
+				return
+			}
+			if h.webhookSender != nil {
+				h.webhookSender.DispatchEvent("item.updated", updated)
+			}
+		},
+		ProcessMentions: func(params services.ProcessMentionsParams) error {
+			if h.mentionService == nil {
+				return nil
+			}
+			return h.mentionService.ProcessMentions(params)
+		},
+		MaskProjectNames: h.maskInaccessibleProjectNames,
+	})
+	return h
+}
+
+// BulkUpdateEmitter exposes the shared side-effect fan-out so other surfaces —
+// REST v1's iteration completion above all — emit exactly what this one does
+// instead of reimplementing it (INFRA-295).
+func (h *ItemHandler) BulkUpdateEmitter() *services.BulkUpdateEmitter {
+	return h.bulkEmitter
 }
 
 func (h *ItemHandler) SetBulkOperationMetrics(metrics *services.BulkOperationMetrics) {
@@ -1015,15 +1058,6 @@ func (h *ItemHandler) maskInaccessibleProjectNames(userID int, items []models.It
 
 func (h *ItemHandler) maskInaccessibleProjectNamesContext(ctx context.Context, userID int, items []models.Item) {
 	services.NewTimePermissionService(h.db, h.permissionService).MaskInaccessibleProjectNamesContext(ctx, userID, items)
-}
-
-// projectResolutionChanged reports whether an update touched a field that can
-// change an item's (or its descendants') effective project: the direct project,
-// the inherit flag, or the parent link.
-func projectResolutionChanged(original, updated *models.Item) bool {
-	return original.InheritProject != updated.InheritProject ||
-		!intPtrEqual(original.ProjectID, updated.ProjectID) ||
-		!intPtrEqual(original.ParentID, updated.ParentID)
 }
 
 // invalidateEffectiveProjectSubtree drops the cached hierarchy entry for an item

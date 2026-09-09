@@ -56,6 +56,13 @@ type Deps struct {
 	// PageApplicationService is the permission-aware mutation/audit pipeline
 	// shared by cookie, REST v1, and MCP page operations.
 	PageApplicationService *services.PageApplicationService
+	// BulkUpdateEmitter is the shared side-effect fan-out for bulk item
+	// mutations (activity, cache invalidation, webhooks/notifications,
+	// mentions, project-name masking) owned by the cookie-auth item handler.
+	// Wiring it makes a v1 iteration completion emit exactly what a session
+	// completion emits (INFRA-295); nil keeps the pre-INFRA-295 behaviour —
+	// the completion persists and emits nothing.
+	BulkUpdateEmitter *services.BulkUpdateEmitter
 	// PageDiagramService owns Page-scoped diagram attachment mutations.
 	PageDiagramService *services.PageDiagramService
 	// AssetPermissionService gates the v1 asset surface against the
