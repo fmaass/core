@@ -18,6 +18,7 @@
     nodesToStatuses,
     edgesToTransitions,
     createEdge,
+    resolveConnectionDirection,
     addPreservationTransitions,
     positionPersistence,
     DEFAULT_WORKFLOW_POSITIONS
@@ -112,16 +113,48 @@
     }
   }
 
-  function onConnect(params) {
-    // Auto-correct direction based on handle types (source vs target)
-    let { source, target, sourceHandle, targetHandle } = params;
-    const fromIsTarget = sourceHandle?.startsWith('target') || sourceHandle === 'target';
-    const toIsSource = targetHandle?.startsWith('target') === false && targetHandle !== undefined && targetHandle !== null;
+  // The node the current drag STARTED on. Svelte Flow reports a connection
+  // normalized by the started handle's TYPE rather than by the direction the
+  // user drew it: a drag begun on a target handle arrives with source and target
+  // already swapped. Each status node carries a source and a target handle
+  // stacked on every side and the grab resolves to the TARGET one — observed
+  // directly: dragging A→B raises onconnectstart with
+  // {nodeId: A, handleId: 'target-right', handleType: 'target'} and onconnect
+  // with {source: B, target: A} (INFRA-60). `onconnectstart` is the one
+  // unambiguous record of where the pointer went down, so the drawn direction is
+  // taken from it. The heuristic that used to sit here inferred the direction
+  // from the handle ids and could not work: it swapped only when the DROP end was
+  // a source handle, and under ConnectionMode.Loose both ends resolve to target
+  // handles, so it never fired once.
+  //
+  // Kept until the next start rather than cleared on use: one gesture can raise
+  // both the drag and the click-to-connect path.
+  let connectStartNodeId = null;
 
-    // If drag started on a target handle and ended on a source handle, swap to keep flow direction intuitive
-    if (fromIsTarget && toIsSource) {
-      [source, target] = [target, source];
-      [sourceHandle, targetHandle] = [targetHandle, sourceHandle];
+  function onConnectStart(_event, params) {
+    connectStartNodeId = params?.nodeId ?? null;
+  }
+
+  function onConnect(params) {
+    // `bind:edges` means Svelte Flow has ALREADY appended its own edge for this
+    // connection, built straight from the reversed params and carrying no `data`.
+    // That raw edge is what used to be saved — the reversed transition the ticket
+    // reports — because the duplicate check below then matched it and this
+    // handler's corrected edge was never added. Every edge the app builds carries
+    // data.from_status_id, so dropping the ones that do not removes exactly the
+    // library's own and nothing else.
+    edges = edges.filter((edge) => edge.data?.from_status_id !== undefined);
+
+    const { source, target, sourceHandle, targetHandle } = resolveConnectionDirection(
+      params,
+      connectStartNodeId
+    );
+
+    // A drag that begins and ends on the same node draws a status that can only
+    // transition to itself — nothing the state machine can use.
+    if (source === target) {
+      edges = calculateEdgeOffsets(edges);
+      return;
     }
 
     // Normalize handles to match actual handle IDs on nodes
@@ -138,9 +171,7 @@
     const toStatusId = parseInt(target.replace('status-', ''));
 
     // Check if transition already exists
-    const existingEdge = edges.find(edge =>
-      edge.source === source && edge.target === target
-    );
+    const existingEdge = edges.find((edge) => edge.source === source && edge.target === target);
 
     if (!existingEdge) {
       const newEdge = {
@@ -149,6 +180,8 @@
         targetHandle: finalTargetHandle
       };
       edges = calculateEdgeOffsets(addEdge(newEdge, edges));
+    } else {
+      edges = calculateEdgeOffsets(edges);
     }
   }
 
@@ -450,6 +483,8 @@
       {nodeTypes}
       {edgeTypes}
       onconnect={onConnect}
+      onconnectstart={onConnectStart}
+      onclickconnectstart={onConnectStart}
       onnodedragstop={onNodeDragStop}
       {...legacyChangeHandlers}
       {...flowOptions}

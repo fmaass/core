@@ -147,6 +147,35 @@ export function createEdge(fromStatusId, toStatusId, workflowId) {
 }
 
 /**
+ * Resolve the direction a connection was DRAWN in.
+ *
+ * Svelte Flow normalizes a connection by the started handle's TYPE, not by the
+ * direction the pointer travelled: a drag begun on a target handle arrives with
+ * `source` and `target` already swapped. Status nodes stack a source and a
+ * target handle on every side and the grab resolves to the target one, so every
+ * drag arrives reversed (INFRA-60). `onconnectstart` reports the node the
+ * pointer went down on, and that is the only unambiguous record of the drawn
+ * direction — the handle ids are not, because under ConnectionMode.Loose both
+ * ends of the reported connection are target handles.
+ *
+ * @param {{source: string, target: string, sourceHandle?: string|null, targetHandle?: string|null}} params
+ * @param {string|null} startNodeId - node id reported by onconnectstart
+ * @returns {{source: string, target: string, sourceHandle: string|null|undefined, targetHandle: string|null|undefined}}
+ */
+export function resolveConnectionDirection(params, startNodeId) {
+  const { source, target, sourceHandle, targetHandle } = params;
+  if (startNodeId && target === startNodeId && source !== startNodeId) {
+    return {
+      source: target,
+      target: source,
+      sourceHandle: targetHandle,
+      targetHandle: sourceHandle,
+    };
+  }
+  return { source, target, sourceHandle, targetHandle };
+}
+
+/**
  * Add preservation transitions for disconnected statuses
  * @param {Array} statuses - Workflow statuses
  * @param {Array} transitions - Current transitions

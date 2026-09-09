@@ -28,6 +28,10 @@ cx
 # Public regression coverage for the locale runtime ships with the implementation.
 !frontend/src/lib/stores/i18n-utils.spec.js
 
+# Public regression coverage for the workflow designer's edge direction and for
+# the transition-preservation marker ships with the implementation (INFRA-60).
+!frontend/src/lib/utils/dataTransformers.spec.js
+
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 

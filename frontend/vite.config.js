@@ -83,6 +83,12 @@ export default defineConfig({
       '@xterm/addon-webgl',
     ],
   },
+  test: {
+    // Unit tests for pure modules. Component tests would need an environment;
+    // none is set here because none of the collected specs mount a component.
+    environment: 'node',
+    include: ['src/**/*.spec.js'],
+  },
   server: {
     port: 5555,
     proxy: {
